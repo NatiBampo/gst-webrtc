@@ -166,7 +166,8 @@
    if (g_str_has_prefix (name, "video")) {
      handle_media_stream (pad, pipe, "videoconvert", "autovideosink");
    } else if (g_str_has_prefix (name, "audio")) {
-     handle_media_stream (pad, pipe, "audioconvert", "autoaudiosink");
+    //uncomment when ready
+     //handle_media_stream (pad, pipe, "audioconvert", "autoaudiosink");
    } else {
      gst_printerr ("Unknown pad %s, ignoring", GST_PAD_NAME (pad));
    }
@@ -415,113 +416,218 @@
  
  #define RTP_TWCC_URI "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
  
- static gboolean
- start_pipeline (gboolean create_offer)
- {
-   GstStateChangeReturn ret;
-   GError *error = NULL;
- 
-   pipe1 =
-       gst_parse_launch ("webrtcbin bundle-policy=max-bundle name=sendrecv "
-       STUN_SERVER
-       "videotestsrc is-live=true pattern=ball ! videoconvert ! queue ! "
-       /* increase the default keyframe distance, browsers have really long
-        * periods between keyframes and rely on PLI events on packet loss to
-        * fix corrupted video.
-        */
-       "vp8enc deadline=1 keyframe-max-dist=2000 ! "
-       /* picture-id-mode=15-bit seems to make TWCC stats behave better */
-       "rtpvp8pay name=videopay picture-id-mode=15-bit ! "
-       "queue ! " RTP_CAPS_VP8 "96 ! sendrecv. "
-       "audiotestsrc is-live=true wave=red-noise ! audioconvert ! audioresample ! queue ! opusenc ! rtpopuspay name=audiopay ! "
-       "queue ! " RTP_CAPS_OPUS "97 ! sendrecv. ", &error);
- 
-   if (error) {
-     gst_printerr ("Failed to parse launch: %s\n", error->message);
-     g_error_free (error);
-     goto err;
-   }
- 
-   webrtc1 = gst_bin_get_by_name (GST_BIN (pipe1), "sendrecv");
-   g_assert_nonnull (webrtc1);
- 
-   if (remote_is_offerer) {
-     /* XXX: this will fail when the remote offers twcc as the extension id
-      * cannot currently be negotiated when receiving an offer.
-      */
-     GST_FIXME ("Need to implement header extension negotiation when "
-         "reciving a remote offers");
-   } else {
-     GstElement *videopay, *audiopay;
-     GstRTPHeaderExtension *video_twcc, *audio_twcc;
- 
-     videopay = gst_bin_get_by_name (GST_BIN (pipe1), "videopay");
-     g_assert_nonnull (videopay);
-     video_twcc = gst_rtp_header_extension_create_from_uri (RTP_TWCC_URI);
-     g_assert_nonnull (video_twcc);
-     gst_rtp_header_extension_set_id (video_twcc, 1);
-     g_signal_emit_by_name (videopay, "add-extension", video_twcc);
-     g_clear_object (&video_twcc);
-     g_clear_object (&videopay);
- 
-     audiopay = gst_bin_get_by_name (GST_BIN (pipe1), "audiopay");
-     g_assert_nonnull (audiopay);
-     audio_twcc = gst_rtp_header_extension_create_from_uri (RTP_TWCC_URI);
-     g_assert_nonnull (audio_twcc);
-     gst_rtp_header_extension_set_id (audio_twcc, 1);
-     g_signal_emit_by_name (audiopay, "add-extension", audio_twcc);
-     g_clear_object (&audio_twcc);
-     g_clear_object (&audiopay);
-   }
- 
-   /* This is the gstwebrtc entry point where we create the offer and so on. It
-    * will be called when the pipeline goes to PLAYING. */
-   g_signal_connect (webrtc1, "on-negotiation-needed",
-       G_CALLBACK (on_negotiation_needed), GINT_TO_POINTER (create_offer));
-   /* We need to transmit this ICE candidate to the browser via the websockets
-    * signalling server. Incoming ice candidates from the browser need to be
-    * added by us too, see on_server_message() */
-   g_signal_connect (webrtc1, "on-ice-candidate",
-       G_CALLBACK (send_ice_candidate_message), NULL);
-   g_signal_connect (webrtc1, "notify::ice-gathering-state",
-       G_CALLBACK (on_ice_gathering_state_notify), NULL);
- 
-   gst_element_set_state (pipe1, GST_STATE_READY);
- 
-   g_signal_emit_by_name (webrtc1, "create-data-channel", "channel", NULL,
-       &send_channel);
-   if (send_channel) {
-     gst_print ("Created data channel\n");
-     connect_data_channel_signals (send_channel);
-   } else {
-     gst_print ("Could not create data channel, is usrsctp available?\n");
-   }
- 
-   g_signal_connect (webrtc1, "on-data-channel", G_CALLBACK (on_data_channel),
-       NULL);
-   /* Incoming streams will be exposed via this signal */
-   g_signal_connect (webrtc1, "pad-added", G_CALLBACK (on_incoming_stream),
-       pipe1);
-   /* Lifetime is the same as the pipeline itself */
-   gst_object_unref (webrtc1);
- 
-   g_timeout_add (100, (GSourceFunc) webrtcbin_get_stats, webrtc1);
- 
-   gst_print ("Starting pipeline\n");
-   ret = gst_element_set_state (GST_ELEMENT (pipe1), GST_STATE_PLAYING);
-   if (ret == GST_STATE_CHANGE_FAILURE)
-     goto err;
- 
-   return TRUE;
- 
- err:
-   if (pipe1)
-     g_clear_object (&pipe1);
-   if (webrtc1)
-     webrtc1 = NULL;
-   return FALSE;
- }
- 
+static gboolean
+start_pipeline (gboolean create_offer)
+{
+  GstStateChangeReturn ret;
+  GError *error = NULL;
+  GstElement *src, *filter, *queue, *encoder, *payloader, *capsfilter;
+  GstPad *pad;
+  GstCaps *caps;
+
+  // Создаем основной конвейер
+  pipe1 = gst_pipeline_new("webrtc-pipeline");
+  if (!pipe1) {
+    gst_printerr("Failed to create pipeline\n");
+    return FALSE;
+  }
+
+  // Создаем и настраиваем webrtcbin
+  webrtc1 = gst_element_factory_make("webrtcbin", "sendrecv");
+  if (!webrtc1) {
+    gst_printerr("Failed to create webrtcbin\n");
+    goto err;
+  }
+  g_object_set(webrtc1, "bundle-policy", GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE, NULL);
+  g_object_set(webrtc1, "stun-server", "stun://stun.l.google.com:19302", NULL);
+
+  // Добавляем webrtcbin в конвейер
+  gst_bin_add(GST_BIN(pipe1), webrtc1);
+
+  /**************** Видео поток ****************/
+  
+// Видео элементы создаются и добавляются в конвейер
+  GstElement *videosrc = gst_element_factory_make("videotestsrc", "videosrc");
+  GstElement *videoconvert = gst_element_factory_make("videoconvert", "videoconvert");
+  GstElement *videoqueue = gst_element_factory_make("queue", "videoqueue");
+  GstElement *vp8enc = gst_element_factory_make("vp8enc", "vp8enc");
+  GstElement *rtpvp8pay = gst_element_factory_make("rtpvp8pay", "rtpvp8pay");
+  GstElement *videocapsfilter = gst_element_factory_make("capsfilter", "videocapsfilter");
+
+  if (!videosrc || !videoconvert || !videoqueue || !vp8enc || !rtpvp8pay || !videocapsfilter) {
+    gst_printerr("Failed to create video elements\n");
+    goto err;
+  }
+
+  // Настройка видео элементов
+  g_object_set(videosrc, "is-live", TRUE, "pattern", 18, NULL); // 18 = ball pattern
+  g_object_set(vp8enc, "deadline", 1, "keyframe-max-dist", 2000, NULL);
+  g_object_set(rtpvp8pay, "picture-id-mode", 2, NULL); // 2 = 15-bit picture ID
+  
+  GstCaps *videocaps = gst_caps_from_string(RTP_CAPS_VP8 "96");
+  g_object_set(videocapsfilter, "caps", videocaps, NULL);
+  gst_caps_unref(videocaps);
+
+  // Добавление и соединение видео элементов
+  gst_bin_add_many(GST_BIN(pipe1), videosrc, videoconvert, videoqueue, vp8enc, rtpvp8pay, videocapsfilter, NULL);
+  if (!gst_element_link_many(videosrc, videoconvert, videoqueue, vp8enc, rtpvp8pay, videocapsfilter, NULL)) {
+    gst_printerr("Failed to link video elements\n");
+    goto err;
+  }
+
+  // Подключение видео к webrtcbin
+  GstPad *videopad = gst_element_get_static_pad(videocapsfilter, "src");
+  GstPad *sinkpad = gst_element_get_request_pad(webrtc1, "sink_%u");
+  if (gst_pad_link(videopad, sinkpad) != GST_PAD_LINK_OK) {
+    gst_printerr("Failed to link video to webrtcbin\n");
+    goto err;
+  }
+  gst_object_unref(videopad);
+  gst_object_unref(sinkpad);
+
+  /**************** Аудио поток ****************/
+  /*
+  // Аудио источник
+  src = gst_element_factory_make("audiotestsrc", "audiosrc");
+  if (!src) {
+    gst_printerr("Failed to create audiotestsrc\n");
+    goto err;
+  }
+  // Было:
+  //g_object_set(src, "is-live", TRUE, "wave", "red-noise", NULL);
+  // Стало:
+  g_object_set(src, "is-live", TRUE, "wave", 4, NULL); // 4 - это GST_AUDIO_TEST_WAVE_RED_NOISE
+  
+  // Аудио конвертер
+  filter = gst_element_factory_make("audioconvert", "audioconvert");
+  if (!filter) {
+    gst_printerr("Failed to create audioconvert\n");
+    goto err;
+  }
+  
+  // Ресемплер аудио
+  GstElement *resample = gst_element_factory_make("audioresample", "audioresample");
+  if (!resample) {
+    gst_printerr("Failed to create audioresample\n");
+    goto err;
+  }
+  
+  // Очередь аудио
+  queue = gst_element_factory_make("queue", "audioqueue");
+  if (!queue) {
+    gst_printerr("Failed to create audio queue\n");
+    goto err;
+  }
+  
+  // Аудио кодировщик Opus
+  encoder = gst_element_factory_make("opusenc", "opusencoder");
+  if (!encoder) {
+    gst_printerr("Failed to create opusenc\n");
+    goto err;
+  }
+  
+  // RTP упаковщик для Opus
+  payloader = gst_element_factory_make("rtpopuspay", "audiopay");
+  if (!payloader) {
+    gst_printerr("Failed to create rtpopuspay\n");
+    goto err;
+  }
+  
+  // Фильтр caps для аудио
+  capsfilter = gst_element_factory_make("capsfilter", "audio-capsfilter");
+  if (!capsfilter) {
+    gst_printerr("Failed to create audio capsfilter\n");
+    goto err;
+  }
+  caps = gst_caps_from_string(RTP_CAPS_OPUS "97");
+  g_object_set(capsfilter, "caps", caps, NULL);
+  gst_caps_unref(caps);
+  
+  // Добавляем все аудио элементы в конвейер
+  gst_bin_add_many(GST_BIN(pipe1), src, filter, resample, queue, encoder, payloader, capsfilter, NULL);
+  
+  // Соединяем аудио элементы
+  if (!gst_element_link_many(src, filter, resample, queue, encoder, payloader, capsfilter, NULL)) {
+    gst_printerr("Failed to link audio elements\n");
+    goto err;
+  }
+  
+  // Получаем src pad фильтра caps и подключаем к webrtcbin
+  pad = gst_element_get_static_pad(capsfilter, "src");
+  gst_element_add_pad(webrtc1, gst_ghost_pad_new("audio_sink", pad));
+  gst_object_unref(pad);*/
+
+  /**************** Настройка WebRTC ****************/
+
+  if (!remote_is_offerer) {
+    // Настройка TWCC для видео
+    GstElement *videopay = gst_bin_get_by_name(GST_BIN(pipe1), "videopay");
+    if (videopay) {
+      GstRTPHeaderExtension *video_twcc = gst_rtp_header_extension_create_from_uri(RTP_TWCC_URI);
+      if (video_twcc) {
+        gst_rtp_header_extension_set_id(video_twcc, 1);
+        g_signal_emit_by_name(videopay, "add-extension", video_twcc);
+        gst_object_unref(video_twcc);
+      }
+      gst_object_unref(videopay);
+    }
+
+    // Настройка TWCC для аудио
+    /*GstElement *audiopay = gst_bin_get_by_name(GST_BIN(pipe1), "audiopay");
+    if (audiopay) {
+      GstRTPHeaderExtension *audio_twcc = gst_rtp_header_extension_create_from_uri(RTP_TWCC_URI);
+      if (audio_twcc) {
+        gst_rtp_header_extension_set_id(audio_twcc, 1);
+        g_signal_emit_by_name(audiopay, "add-extension", audio_twcc);
+        gst_object_unref(audio_twcc);
+      }
+      gst_object_unref(audiopay);
+    }*/
+  }
+
+  // Подключаем сигналы webrtcbin
+  g_signal_connect(webrtc1, "on-negotiation-needed",
+      G_CALLBACK(on_negotiation_needed), GINT_TO_POINTER(create_offer));
+  g_signal_connect(webrtc1, "on-ice-candidate",
+      G_CALLBACK(send_ice_candidate_message), NULL);
+  g_signal_connect(webrtc1, "notify::ice-gathering-state",
+      G_CALLBACK(on_ice_gathering_state_notify), NULL);
+  g_signal_connect(webrtc1, "on-data-channel",
+      G_CALLBACK(on_data_channel), NULL);
+  g_signal_connect(webrtc1, "pad-added",
+      G_CALLBACK(on_incoming_stream), pipe1);
+
+  // Создаем data channel
+  g_signal_emit_by_name(webrtc1, "create-data-channel", "channel", NULL, &send_channel);
+  if (send_channel) {
+    gst_print("Created data channel\n");
+    connect_data_channel_signals(send_channel);
+  } else {
+    gst_print("Could not create data channel, is usrsctp available?\n");
+  }
+
+  // Запускаем сбор статистики
+  g_timeout_add(100, (GSourceFunc)webrtcbin_get_stats, webrtc1);
+
+  // Запускаем конвейер
+  gst_print("Starting pipeline\n");
+  ret = gst_element_set_state(pipe1, GST_STATE_PLAYING);
+  if (ret == GST_STATE_CHANGE_FAILURE) {
+    gst_printerr("Failed to start pipeline\n");
+    goto err;
+  }
+
+  return TRUE;
+
+err:
+  if (pipe1) {
+    gst_object_unref(pipe1);
+    pipe1 = NULL;
+  }
+  webrtc1 = NULL;
+  return FALSE;
+}
+
  static gboolean
  setup_call (void)
  {
